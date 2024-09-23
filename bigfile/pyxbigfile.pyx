@@ -4,8 +4,25 @@ from libc.stddef cimport ptrdiff_t
 from libc.string cimport strcpy, memcpy
 from libc.stdlib cimport free
 import numpy
+from mpi4py import MPI
+import ctypes
 
 numpy.import_array()
+# Include the generated file with the correct MPI_Comm type
+#include "mpi_comm_config.pxi"
+# Define a C surrogate for the mpi4py's COMM_WORLD, to be passed to
+# bigfile-mpi functions.
+# Defining MPI_Comm in a way that works with both OpenMPI and MPICH
+# (OpenMPI uses int, MPICH uses void*)
+#IF MPI._sizeof(MPI.Comm) == ctypes.sizeof(ctypes.c_int):
+#    cdef int MPI_Comm
+#ELSE:
+#    cdef void* MPI_Comm
+
+if MPI._sizeof(MPI.Comm) == ctypes.sizeof(ctypes.c_int):
+    MPI_Comm = ctypes.c_int
+else:
+    MPI_Comm = ctypes.c_void_p
 
 try:
     basestring  # attempt to evaluate basestring
@@ -15,7 +32,8 @@ except NameError:
     def isstr(s):
         return isinstance(s, str)
 
-cdef extern from "bigfile.h":
+cdef extern from "bigfile-mpi.h":
+        
     struct CBigFile "BigFile":
         char * basename
 
@@ -60,11 +78,11 @@ cdef extern from "bigfile.h":
         CBigRecordField * fields
         int nfield
         int itemsize
-
+    
     char * big_file_get_error_message() nogil
     void big_file_set_buffer_size(size_t bytes) nogil
-    int big_block_grow(CBigBlock * bb, int Nfilegrow, size_t fsize[]) nogil
-    int big_block_close(CBigBlock * block) nogil
+    int big_block_mpi_grow(CBigBlock * bb, int Nfilegrow, size_t fsize[], int comm) nogil
+    int big_block_mpi_close(CBigBlock * block, int comm) nogil
     void _big_block_close_internal(CBigBlock * block) nogil
     void * _big_block_pack(CBigBlock * block, size_t * n) nogil
     void _big_block_unpack(CBigBlock * block, void * buf) nogil
@@ -82,12 +100,12 @@ cdef extern from "bigfile.h":
     CBigAttr * big_block_list_attrs(CBigBlock * block, size_t * count) nogil
     int big_array_init(CBigArray * array, void * buf, char * dtype, int ndim, size_t dims[], ptrdiff_t strides[]) nogil
 
-    int big_file_open_block(CBigFile * bf, CBigBlock * block, char * blockname) nogil
-    int big_file_create_block(CBigFile * bf, CBigBlock * block, char * blockname, char * dtype, int nmemb, int Nfile, size_t fsize[]) nogil
-    int big_file_open(CBigFile * bf, char * basename) nogil
+    int big_file_mpi_open_block(CBigFile * bf, CBigBlock * block, char * blockname, int comm) nogil
+    int big_file_mpi_create_block(CBigFile * bf, CBigBlock * block, char * blockname, char * dtype, int nmemb, int Nfile, size_t fsize[], int comm) nogil
+    int big_file_mpi_open(CBigFile * bf, char * basename, int comm) nogil
     int big_file_list(CBigFile * bf, char *** list, int * N) nogil
-    int big_file_create(CBigFile * bf, char * basename) nogil
-    int big_file_close(CBigFile * bf) nogil
+    int big_file_mpi_create(CBigFile * bf, char * basename, int comm) nogil
+    int big_file_mpi_close(CBigFile * bf, int comm) nogil
 
     void big_record_type_clear(CBigRecordType * rtype) nogil
     void big_record_type_set(CBigRecordType * rtype, int i, char * name, char * dtype, int nmemb) nogil
@@ -96,12 +114,12 @@ cdef extern from "bigfile.h":
     void big_record_get(CBigRecordType * rtype, void * buf, int ifield, void * data) nogil
     int big_record_view_field(CBigRecordType * rtype, int ifield,
         CBigArray * array, size_t size, void * buf) nogil
-    int big_file_write_records(CBigFile * bf, CBigRecordType * rtype,
-        ptrdiff_t offset, size_t size, void * buf) nogil
-    int big_file_read_records(CBigFile * bf, CBigRecordType * rtype,
-        ptrdiff_t offset, size_t size, void * buf) nogil
-    int big_file_create_records(CBigFile * bf, CBigRecordType * rtype,
-        char * mode, size_t Nfile, size_t * size_per_file) nogil
+    int big_file_mpi_write_records(CBigFile * bf, CBigRecordType * rtype,
+        ptrdiff_t offset, size_t size, void * buf, int concurrency, int comm ) nogil
+    int big_file_mpi_read_records(CBigFile * bf, CBigRecordType * rtype,
+        ptrdiff_t offset, size_t size, void * buf, int concurrency, int comm) nogil
+    int big_file_mpi_create_records(CBigFile * bf, CBigRecordType * rtype,
+        char * mode, size_t Nfile, size_t * size_per_file, int comm) nogil
 
 cdef extern from "bigfile-internal.h":
     pass
@@ -372,7 +390,7 @@ cdef class ColumnLowLevelAPI:
         blocknameptr = blockname
         if dtype is None:
             with nogil:
-                rt = big_file_create_block(&f.bf, &self.bb, blocknameptr, NULL,
+                rt = big_file_mpi_create_block(&f.bf, &self.bb, blocknameptr, NULL,
                         0, 0, NULL)
             if rt != 0:
                 raise Error()
@@ -394,7 +412,7 @@ cdef class ColumnLowLevelAPI:
             dtype2 = dtype.base.str.encode()
             dtypeptr = dtype2
             with nogil:
-                rt = big_file_create_block(&f.bf, &self.bb, blocknameptr,
+                rt = big_file_mpi_create_block(&f.bf, &self.bb, blocknameptr,
                     dtypeptr,
                     items, Nfile, <size_t*> fsize.data)
             if rt != 0:
@@ -631,10 +649,14 @@ cdef class Dataset:
         assert self.dtype.itemsize == self.rtype.itemsize
 
     def read(self, numpy.intp_t start, numpy.intp_t length, numpy.ndarray out=None):
+        cdef int comm_c
+        comm_c = int(MPI.COMM_WORLD.handle)
+        # Probably, concurrency should not be hard-coded. But for now, it is.
+        cdef int concurrency = 0
         if out is None:
             out = numpy.empty(length, self.dtype)
         with nogil:
-            rt = big_file_read_records(&self.file.bf, &self.rtype, start, length, out.data)
+            rt = big_file_mpi_read_records(&self.file.bf, &self.rtype, start, length, out.data, concurrency, comm_c)
         if rt != 0:
             raise Error()
         return out
@@ -666,11 +688,17 @@ cdef class Dataset:
         self.write(tail, buf)
 
     def write(self, numpy.intp_t start, numpy.ndarray buf):
+        
         assert buf.dtype == self.dtype
         assert buf.ndim == 1
+        cdef int comm_c
+        comm_c = int(MPI.COMM_WORLD.handle)
+        # Probably, concurrency should not be hard-coded. But for now, it is.
+        cdef int concurrency = 0
         with nogil:
-            rt = big_file_write_records(&self.file.bf, &self.rtype, start, buf.shape[0], buf.data)
+            rt = big_file_mpi_write_records(&self.file.bf, &self.rtype, start, buf.shape[0], buf.data, concurrency, comm_c)
         if rt != 0:
+            raise Error()
             raise Error()
 
     def __dealloc__(self):

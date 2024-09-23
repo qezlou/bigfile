@@ -8,10 +8,12 @@ extensions = [
             sources = [
                 "bigfile/pyxbigfile.pyx",
                 "src/bigfile.c",
+                "src/bigfile-mpi.c",
                 "src/bigfile-record.c",
             ],
             depends = [
                 "src/bigfile.h",
+                "src/bigfile-mpi.h"
                 "src/bigfile-internal.h",
             ],
             include_dirs = ["src/", numpy.get_include()])]
