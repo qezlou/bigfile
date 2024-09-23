@@ -6,6 +6,8 @@ from libc.stdlib cimport free
 import numpy
 
 numpy.import_array()
+from mpi4py cimport MPI as mpi
+from mpi4py import MPI
 
 try:
     basestring  # attempt to evaluate basestring
@@ -102,6 +104,18 @@ cdef extern from "bigfile.h":
         ptrdiff_t offset, size_t size, void * buf) nogil
     int big_file_create_records(CBigFile * bf, CBigRecordType * rtype,
         char * mode, size_t Nfile, size_t * size_per_file) nogil
+cdef extern from "bigfile-mpi.h":
+    int big_file_mpi_open(CBigFile * bf, char * basename, mpi.MPI_Comm comm) nogil
+    int big_file_mpi_create(CBigFile * bf, char * basename, mpi.MPI_Comm comm) nogil
+    int big_file_mpi_open_block(CBigFile * bf, CBigBlock * block, char * blockname, mpi.MPI_Comm comm) nogil
+    int big_file_mpi_create_block(CBigFile * bf, CBigBlock * block, char * blockname, char * dtype, int nmemb, int Nfile, size_t fsize[], mpi.MPI_Comm comm) nogil
+    int big_block_mpi_write(CBigBlock * bb, CBigBlockPtr * ptr, CBigArray * array, int concurrency, mpi.MPI_Comm comm) nogil
+    int big_block_mpi_read(CBigBlock * bb, CBigBlockPtr * ptr, CBigArray * array, int concurrency, mpi.MPI_Comm comm) nogil
+    int big_block_mpi_close(CBigBlock * block, mpi.MPI_Comm comm) nogil
+    int big_block_mpi_flush(CBigBlock * block, mpi.MPI_Comm comm) nogil
+    int big_block_mpi_grow(CBigBlock * bb, int Nfile_grow, size_t fsize_grow[], mpi.MPI_Comm comm) nogil
+    int big_block_mpi_grow_simple(CBigBlock * bb, int Nfile_grow, size_t size_grow, mpi.MPI_Comm comm) nogil
+    int big_file_mpi_close(CBigFile * bf, mpi.MPI_Comm comm) nogil
 
 cdef extern from "bigfile-internal.h":
     pass
@@ -198,6 +212,163 @@ cdef class FileLowLevelAPI:
     def close(self):
         #never really need to close, since we are just freeing a few memory blocks
         pass
+# Add the MPI-aware FileLowLevelAPIMPI class
+cdef class FileLowLevelAPIMPI(FileLowLevelAPI):
+    cdef mpi.Comm comm
+
+    def __init__(self, comm, filename, create=False):
+        """Initialize the MPI-aware FileLowLevelAPI."""
+        if not isinstance(comm, MPI.Comm):
+            raise TypeError("comm must be an mpi4py MPI.Comm object")
+        self.comm = comm
+        filename = filename.encode()
+        cdef char * filenameptr = filename
+        cdef mpi.MPI_Comm c_comm = self.comm
+
+        if create:
+            with nogil:
+                rt = big_file_mpi_create(&self.bf, filenameptr, c_comm)
+        else:
+            with nogil:
+                rt = big_file_mpi_open(&self.bf, filenameptr, c_comm)
+        if rt != 0:
+            raise Error()
+        self._deallocated = False
+
+    def close(self):
+        cdef mpi.MPI_Comm c_comm = self.comm
+        with nogil:
+            rt = big_file_mpi_close(&self.bf, c_comm)
+        if rt != 0:
+            raise Error()
+        self._deallocated = True
+
+    def list_blocks(self):
+        # Implement list_blocks with MPI if necessary
+        return super().list_blocks()
+
+# Add the MPI-aware ColumnLowLevelAPIMPI class
+cdef class ColumnLowLevelAPIMPI(ColumnLowLevelAPI):
+    cdef mpi.Comm comm
+
+    def __init__(self, comm):
+        """Initialize the MPI-aware ColumnLowLevelAPI."""
+        if not isinstance(comm, MPI.Comm):
+            raise TypeError("comm must be an mpi4py MPI.Comm object")
+        self.comm = comm
+
+    def open(self, f, blockname):
+        blockname = blockname.encode()
+        cdef char * blocknameptr = blockname
+        cdef mpi.MPI_Comm c_comm = self.comm
+        with nogil:
+            rt = big_file_mpi_open_block(&f.bf, &self.bb, blocknameptr, c_comm)
+        if rt != 0:
+            raise Error()
+        self._deallocated = False
+
+    def create(self, f, blockname, dtype=None, size=None, Nfile=1):
+        blockname = blockname.encode()
+        cdef char * blocknameptr = blockname
+        cdef mpi.MPI_Comm c_comm = self.comm
+
+        if dtype is None:
+            with nogil:
+                rt = big_file_mpi_create_block(&f.bf, &self.bb, blocknameptr, NULL, 0, 0, NULL, c_comm)
+            if rt != 0:
+                raise Error()
+        else:
+            if Nfile < 0:
+                raise ValueError("Cannot create negative number of files.")
+            if Nfile == 0 and size != 0:
+                raise ValueError("Cannot create zero files for non-zero number of items.")
+            dtype = numpy.dtype(dtype)
+            assert len(dtype.shape) <= 1
+            if len(dtype.shape) == 0:
+                items = 1
+            else:
+                items = dtype.shape[0]
+            fsize = numpy.empty(dtype='intp', shape=Nfile)
+            fsize[:] = (numpy.arange(Nfile) + 1) * size // Nfile \
+                     - (numpy.arange(Nfile)) * size // Nfile
+            dtype2 = dtype.base.str.encode()
+            dtypeptr = dtype2
+            with nogil:
+                rt = big_file_mpi_create_block(&f.bf, &self.bb, blocknameptr, dtypeptr, items, Nfile, <size_t*> fsize.data, c_comm)
+            if rt != 0:
+                raise Error()
+        self._deallocated = False
+
+    def write(self, numpy.intp_t start, numpy.ndarray buf):
+        """MPI-aware write operation."""
+        cdef CBigArray array
+        cdef CBigBlockPtr ptr
+        cdef mpi.MPI_Comm c_comm = self.comm
+
+        big_array_init(&array, buf.data, buf.dtype.str.encode(),
+                       buf.ndim,
+                       <size_t *> buf.shape,
+                       <ptrdiff_t *> buf.strides)
+        with nogil:
+            rt = big_block_seek(&self.bb, &ptr, start)
+        if rt != 0:
+            raise Error()
+
+        with nogil:
+            rt = big_block_mpi_write(&self.bb, &ptr, &array, 0, c_comm)
+        if rt != 0:
+            raise Error()
+
+    def read(self, numpy.intp_t start, numpy.intp_t length, out=None):
+        """MPI-aware read operation."""
+        cdef numpy.ndarray result
+        cdef CBigArray array
+        cdef CBigBlockPtr ptr
+        cdef mpi.MPI_Comm c_comm = self.comm
+
+        if length == -1:
+            length = self.size - start
+        if length + start > self.size:
+            length = self.size - start
+        if out is None:
+            result = numpy.empty(dtype=self.dtype, shape=length)
+        else:
+            result = out
+            if result.shape[0] != length:
+                raise ValueError("output array length mismatches with the request")
+            if result.dtype.base.itemsize != self.dtype.base.itemsize:
+                raise ValueError("output array type mismatches with the block")
+
+        big_array_init(&array, result.data, self.bb.dtype,
+                       result.ndim,
+                       <size_t *> result.shape,
+                       <ptrdiff_t *> result.strides)
+
+        with nogil:
+            rt = big_block_seek(&self.bb, &ptr, start)
+        if rt != 0:
+            raise Error()
+
+        with nogil:
+            rt = big_block_mpi_read(&self.bb, &ptr, &array, 0, c_comm)
+        if rt != 0:
+            raise Error()
+        return result
+
+    def close(self):
+        cdef mpi.MPI_Comm c_comm = self.comm
+        with nogil:
+            rt = big_block_mpi_close(&self.bb, c_comm)
+        if rt != 0:
+            raise Error()
+        self._deallocated = True
+
+    def flush(self):
+        cdef mpi.MPI_Comm c_comm = self.comm
+        with nogil:
+            rt = big_block_mpi_flush(&self.bb, c_comm)
+        if rt != 0:
+            raise Error()
 
 cdef class AttrSet:
     cdef readonly ColumnLowLevelAPI bb
